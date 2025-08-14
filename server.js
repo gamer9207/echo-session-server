@@ -9,6 +9,11 @@ const io = new Server(server, { cors: { origin: "*" } });
 
 const sessions = {}; // sessionId -> { host: socket, guest: socket }
 
+// Add a root route for health checks and uptime monitoring
+app.get('/', (req, res) => {
+  res.send('Echo Session Server is running!');
+});
+
 io.on('connection', (socket) => {
   // Create a session
   socket.on('create_session', () => {
@@ -66,6 +71,8 @@ io.on('connection', (socket) => {
   });
 });
 
-server.listen(3000, () => {
-  console.log('Socket.io server listening on port 3000');
+// Use Render's dynamic PORT if available
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`Socket.io server listening on port ${PORT}`);
 });
