@@ -9,24 +9,21 @@ const io = new Server(server, { cors: { origin: "*" } });
 
 const sessions = {}; // sessionId -> { host: socket, guest: socket }
 
-// Add a root route for health checks and uptime monitoring
 app.get('/', (req, res) => {
   res.send('Echo Session Server is running!');
 });
 
 io.on('connection', (socket) => {
-  console.log('Client connected:', socket.id); // <-- NEW LOG LINE
+  console.log('Client connected:', socket.id);
 
-  // Create a session
   socket.on('create_session', () => {
     const sessionId = nanoid(10);
     sessions[sessionId] = { host: socket, guest: null };
     socket.join(sessionId);
     socket.emit('session_created', { sessionId });
-    console.log(`Session created: ${sessionId} by socket ${socket.id}`); // <-- NEW LOG LINE
+    console.log(`Session created: ${sessionId} by socket ${socket.id}`);
   });
 
-  // Join a session
   socket.on('join_session', ({ sessionId }) => {
     const session = sessions[sessionId];
     if (!session) {
@@ -41,7 +38,7 @@ io.on('connection', (socket) => {
     socket.join(sessionId);
     session.host.emit('guest_joined', {});
     socket.emit('session_joined', { sessionId });
-    console.log(`Socket ${socket.id} joined session ${sessionId}`); // <-- NEW LOG LINE
+    console.log(`Socket ${socket.id} joined session ${sessionId}`);
   });
 
   // Playback events: play, pause, seek, etc.
@@ -50,10 +47,23 @@ io.on('connection', (socket) => {
     if (!session) return;
     if (session.host === socket && session.guest) {
       session.guest.emit('playback_event', { event, data });
-      console.log(`Host ${socket.id} sent playback event "${event}" to guest in session ${sessionId}`); // <-- NEW LOG LINE
+      console.log(`Host ${socket.id} sent playback event "${event}" to guest in session ${sessionId}`);
     } else if (session.guest === socket && session.host) {
       session.host.emit('playback_event', { event, data });
-      console.log(`Guest ${socket.id} sent playback event "${event}" to host in session ${sessionId}`); // <-- NEW LOG LINE
+      console.log(`Guest ${socket.id} sent playback event "${event}" to host in session ${sessionId}`);
+    }
+  });
+
+  // Change song event sync
+  socket.on('change_song', ({ sessionId, event, data }) => {
+    const session = sessions[sessionId];
+    if (!session) return;
+    if (session.host === socket && session.guest) {
+      session.guest.emit('change_song', { event, data });
+      console.log(`Host ${socket.id} sent change_song event to guest in session ${sessionId}`);
+    } else if (session.guest === socket && session.host) {
+      session.host.emit('change_song', { event, data });
+      console.log(`Guest ${socket.id} sent change_song event to host in session ${sessionId}`);
     }
   });
 
@@ -64,10 +74,10 @@ io.on('connection', (socket) => {
         const other = session.host === socket ? session.guest : session.host;
         if (other) other.emit('partner_left', {});
         if (session.host === socket) {
-          console.log(`Host ${socket.id} disconnected, deleting session ${sessionId}`); // <-- NEW LOG LINE
+          console.log(`Host ${socket.id} disconnected, deleting session ${sessionId}`);
           delete sessions[sessionId];
         } else {
-          console.log(`Guest ${socket.id} disconnected from session ${sessionId}`); // <-- NEW LOG LINE
+          console.log(`Guest ${socket.id} disconnected from session ${sessionId}`);
           session.guest = null;
         }
       }
@@ -75,7 +85,6 @@ io.on('connection', (socket) => {
   });
 });
 
-// Use Render's dynamic PORT if available
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`Socket.io server listening on port ${PORT}`);
