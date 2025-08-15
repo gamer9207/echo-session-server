@@ -42,15 +42,17 @@ io.on('connection', (socket) => {
   });
 
   // Playback events: play, pause, seek, etc.
-  socket.on('playback_event', ({ sessionId, event, data }) => {
+  socket.on('playback_event', ({ sessionId, event, data, position }) => {
     const session = sessions[sessionId];
     if (!session) return;
+    // Pass position as top-level for sync protocol
+    const payload = { event, position, data };
     if (session.host === socket && session.guest) {
-      session.guest.emit('playback_event', { event, data });
-      console.log(`Host ${socket.id} sent playback event "${event}" to guest in session ${sessionId}`);
+      session.guest.emit('playback_event', payload);
+      // console.log(`Host ${socket.id} sent playback event "${event}" to guest in session ${sessionId}`);
     } else if (session.guest === socket && session.host) {
-      session.host.emit('playback_event', { event, data });
-      console.log(`Guest ${socket.id} sent playback event "${event}" to host in session ${sessionId}`);
+      session.host.emit('playback_event', payload);
+      // console.log(`Guest ${socket.id} sent playback event "${event}" to host in session ${sessionId}`);
     }
   });
 
@@ -67,7 +69,7 @@ io.on('connection', (socket) => {
     if (session.host) session.host.emit('prepare_song', { data });
     if (session.guest) session.guest.emit('prepare_song', { data });
 
-    console.log(`Song change requested for session ${sessionId}. Waiting for both clients to be ready.`);
+    // console.log(`Song change requested for session ${sessionId}. Waiting for both clients to be ready.`);
   });
 
   // Each client signals ready after buffering
@@ -77,20 +79,32 @@ io.on('connection', (socket) => {
 
     if (session.host === socket) {
       session.ready.host = true;
-      console.log(`Host in session ${sessionId} is ready.`);
+      // console.log(`Host in session ${sessionId} is ready.`);
     } else if (session.guest === socket) {
       session.ready.guest = true;
-      console.log(`Guest in session ${sessionId} is ready.`);
+      // console.log(`Guest in session ${sessionId} is ready.`);
     }
 
     // When both ready, emit sync_play to both
     if (session.ready.host && session.ready.guest) {
       if (session.host) session.host.emit('sync_play', { data: session.pendingSong });
       if (session.guest) session.guest.emit('sync_play', { data: session.pendingSong });
-      console.log(`Both clients ready in session ${sessionId}. Sent sync_play.`);
+      // console.log(`Both clients ready in session ${sessionId}. Sent sync_play.`);
       session.pendingSong = null;
       session.ready.host = false;
       session.ready.guest = false;
+    }
+  });
+
+  // --- Auto-sync: relay playback position between clients ---
+  socket.on('playback_position', ({ sessionId, position }) => {
+    const session = sessions[sessionId];
+    if (!session) return;
+    // Relay to the other participant
+    if (session.host === socket && session.guest) {
+      session.guest.emit('playback_position', { position });
+    } else if (session.guest === socket && session.host) {
+      session.host.emit('playback_position', { position });
     }
   });
 
@@ -101,10 +115,10 @@ io.on('connection', (socket) => {
         const other = session.host === socket ? session.guest : session.host;
         if (other) other.emit('partner_left', {});
         if (session.host === socket) {
-          console.log(`Host ${socket.id} disconnected, deleting session ${sessionId}`);
+          // console.log(`Host ${socket.id} disconnected, deleting session ${sessionId}`);
           delete sessions[sessionId];
         } else {
-          console.log(`Guest ${socket.id} disconnected from session ${sessionId}`);
+          // console.log(`Guest ${socket.id} disconnected from session ${sessionId}`);
           session.guest = null;
         }
       }
