@@ -97,16 +97,15 @@ io.on('connection', (socket) => {
   });
 
   // --- Auto-sync: relay playback position between clients ---
-  socket.on('playback_position', ({ sessionId, position }) => {
-    const session = sessions[sessionId];
-    if (!session) return;
-    // Relay to the other participant
-    if (session.host === socket && session.guest) {
-      session.guest.emit('playback_position', { position });
-    } else if (session.guest === socket && session.host) {
-      session.host.emit('playback_position', { position });
-    }
-  });
+socket.on('playback_position', ({ sessionId, position }) => {
+  const session = sessions[sessionId];
+  if (!session) return;
+  // Only relay host's position to guest
+  if (session.host === socket && session.guest) {
+    session.guest.emit('playback_position', { position });
+  }
+  // Do NOT relay guest's position to host!
+});
 
   socket.on('disconnect', () => {
     for (const sessionId in sessions) {
