@@ -103,6 +103,7 @@ io.on('connection', (socket) => {
 
   // --- Common queue sync ---
   socket.on('add_to_queue', ({ sessionId, song }) => {
+      console.log('Received add_to_queue', sessionId, song);
     const session = sessions[sessionId];
     if (!session) return;
     // Prevent duplicates
