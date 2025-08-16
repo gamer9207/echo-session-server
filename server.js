@@ -30,22 +30,19 @@ io.on('connection', (socket) => {
     console.log(`Session created: ${sessionId} by socket ${socket.id}`);
   });
 
-  // Improved: send invalid_session for wrong code, and session_full
   socket.on('join_session', ({ sessionId }) => {
     const session = sessions[sessionId];
     if (!session) {
-      socket.emit('invalid_session', { message: 'Invalid session code.' });
+      socket.emit('error', { message: 'Session not found.' });
       return;
     }
     if (session.guest) {
-      socket.emit('session_full', { message: 'Session is full.' });
+      socket.emit('error', { message: 'Session is full.' });
       return;
     }
     session.guest = socket;
     socket.join(sessionId);
-    // Notify host
     session.host.emit('guest_joined', {});
-    // Notify guest of join
     socket.emit('session_joined', { sessionId });
     // Send current queue to new guest
     socket.emit('queue_updated', { queue: session.queue });
@@ -106,7 +103,7 @@ io.on('connection', (socket) => {
 
   // --- Common queue sync ---
   socket.on('add_to_queue', ({ sessionId, song }) => {
-    console.log('Received add_to_queue', sessionId, song);
+      console.log('Received add_to_queue', sessionId, song);
     const session = sessions[sessionId];
     if (!session) return;
     // Prevent duplicates
@@ -139,12 +136,13 @@ io.on('connection', (socket) => {
     io.to(sessionId).emit('queue_updated', { queue: session.queue });
   });
 
-  socket.on('update_queue', ({ sessionId, queue }) => {
-    const session = sessions[sessionId];
-    if (!session) return;
-    session.queue = queue;
-    io.to(sessionId).emit('queue_updated', { queue: session.queue });
-  });
+  // Add this handler:
+socket.on('update_queue', ({ sessionId, queue }) => {
+  const session = sessions[sessionId];
+  if (!session) return;
+  session.queue = queue;
+  io.to(sessionId).emit('queue_updated', { queue: session.queue });
+});
 
   socket.on('clear_queue', ({ sessionId }) => {
     const session = sessions[sessionId];
@@ -153,31 +151,13 @@ io.on('connection', (socket) => {
     io.to(sessionId).emit('queue_updated', { queue: session.queue });
   });
 
-  // Explicit leave event from client
-  socket.on('leave_session', ({ sessionId }) => {
-    const session = sessions[sessionId];
-    if (!session) return;
-    const isHost = session.host === socket;
-    const other = isHost ? session.guest : session.host;
-    if (other) other.emit('session_ended', { reason: "The other user left the session." });
-    if (isHost) {
-      delete sessions[sessionId];
-    } else {
-      session.guest = null;
-    }
-    socket.leave(sessionId);
-  });
-
-  // Enhanced disconnect logic
   socket.on('disconnect', () => {
     for (const sessionId in sessions) {
       const session = sessions[sessionId];
       if (session.host === socket || session.guest === socket) {
-        const isHost = session.host === socket;
-        const other = isHost ? session.guest : session.host;
-        if (other)
-          other.emit('session_ended', { reason: "Session ended (network/server/partner issue)." });
-        if (isHost) {
+        const other = session.host === socket ? session.guest : session.host;
+        if (other) other.emit('partner_left', {});
+        if (session.host === socket) {
           delete sessions[sessionId];
         } else {
           session.guest = null;
