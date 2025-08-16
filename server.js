@@ -7,7 +7,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-const sessions = {}; // sessionId -> { host: socket, guest: socket, ready: { host: false, guest: false }, pendingSong: null }
+const sessions = {}; // sessionId -> { host, guest, ready, pendingSong, queue }
 
 app.get('/', (req, res) => {
   res.send('Echo Session Server is running!');
@@ -18,7 +18,13 @@ io.on('connection', (socket) => {
 
   socket.on('create_session', () => {
     const sessionId = nanoid(10);
-    sessions[sessionId] = { host: socket, guest: null, ready: { host: false, guest: false }, pendingSong: null };
+    sessions[sessionId] = {
+      host: socket,
+      guest: null,
+      ready: { host: false, guest: false },
+      pendingSong: null,
+      queue: []
+    };
     socket.join(sessionId);
     socket.emit('session_created', { sessionId });
     console.log(`Session created: ${sessionId} by socket ${socket.id}`);
@@ -38,6 +44,8 @@ io.on('connection', (socket) => {
     socket.join(sessionId);
     session.host.emit('guest_joined', {});
     socket.emit('session_joined', { sessionId });
+    // Send current queue to new guest
+    socket.emit('queue_updated', { queue: session.queue });
     console.log(`Socket ${socket.id} joined session ${sessionId}`);
   });
 
@@ -45,14 +53,11 @@ io.on('connection', (socket) => {
   socket.on('playback_event', ({ sessionId, event, data, position }) => {
     const session = sessions[sessionId];
     if (!session) return;
-    // Pass position as top-level for sync protocol
     const payload = { event, position, data };
     if (session.host === socket && session.guest) {
       session.guest.emit('playback_event', payload);
-      // console.log(`Host ${socket.id} sent playback event "${event}" to guest in session ${sessionId}`);
     } else if (session.guest === socket && session.host) {
       session.host.emit('playback_event', payload);
-      // console.log(`Guest ${socket.id} sent playback event "${event}" to host in session ${sessionId}`);
     }
   });
 
@@ -60,16 +65,11 @@ io.on('connection', (socket) => {
   socket.on('change_song', ({ sessionId, data }) => {
     const session = sessions[sessionId];
     if (!session) return;
-    // Save the pending song data for session
     session.pendingSong = data;
     session.ready.host = false;
     session.ready.guest = false;
-
-    // Emit to both clients: "prepare_song" (buffer but don't play yet)
     if (session.host) session.host.emit('prepare_song', { data });
     if (session.guest) session.guest.emit('prepare_song', { data });
-
-    // console.log(`Song change requested for session ${sessionId}. Waiting for both clients to be ready.`);
   });
 
   // Each client signals ready after buffering
@@ -79,17 +79,13 @@ io.on('connection', (socket) => {
 
     if (session.host === socket) {
       session.ready.host = true;
-      // console.log(`Host in session ${sessionId} is ready.`);
     } else if (session.guest === socket) {
       session.ready.guest = true;
-      // console.log(`Guest in session ${sessionId} is ready.`);
     }
 
-    // When both ready, emit sync_play to both
     if (session.ready.host && session.ready.guest) {
       if (session.host) session.host.emit('sync_play', { data: session.pendingSong });
       if (session.guest) session.guest.emit('sync_play', { data: session.pendingSong });
-      // console.log(`Both clients ready in session ${sessionId}. Sent sync_play.`);
       session.pendingSong = null;
       session.ready.host = false;
       session.ready.guest = false;
@@ -97,15 +93,54 @@ io.on('connection', (socket) => {
   });
 
   // --- Auto-sync: relay playback position between clients ---
-socket.on('playback_position', ({ sessionId, position }) => {
-  const session = sessions[sessionId];
-  if (!session) return;
-  // Only relay host's position to guest
-  if (session.host === socket && session.guest) {
-    session.guest.emit('playback_position', { position });
-  }
-  // Do NOT relay guest's position to host!
-});
+  socket.on('playback_position', ({ sessionId, position }) => {
+    const session = sessions[sessionId];
+    if (!session) return;
+    if (session.host === socket && session.guest) {
+      session.guest.emit('playback_position', { position });
+    }
+  });
+
+  // --- Common queue sync ---
+  socket.on('add_to_queue', ({ sessionId, song }) => {
+    const session = sessions[sessionId];
+    if (!session) return;
+    // Prevent duplicates
+    if (!session.queue.some(s => s.videoId === song.videoId)) {
+      session.queue.push(song);
+    }
+    io.to(sessionId).emit('queue_updated', { queue: session.queue });
+  });
+
+  socket.on('remove_from_queue', ({ sessionId, videoId }) => {
+    const session = sessions[sessionId];
+    if (!session) return;
+    session.queue = session.queue.filter(s => s.videoId !== videoId);
+    io.to(sessionId).emit('queue_updated', { queue: session.queue });
+  });
+
+  socket.on('move_in_queue', ({ sessionId, oldIndex, newIndex }) => {
+    const session = sessions[sessionId];
+    if (!session) return;
+    const queue = session.queue;
+    if (
+      oldIndex < 0 ||
+      oldIndex >= queue.length ||
+      newIndex < 0 ||
+      newIndex > queue.length
+    ) return;
+    const [song] = queue.splice(oldIndex, 1);
+    queue.splice(newIndex, 0, song);
+    session.queue = queue;
+    io.to(sessionId).emit('queue_updated', { queue: session.queue });
+  });
+
+  socket.on('clear_queue', ({ sessionId }) => {
+    const session = sessions[sessionId];
+    if (!session) return;
+    session.queue = [];
+    io.to(sessionId).emit('queue_updated', { queue: session.queue });
+  });
 
   socket.on('disconnect', () => {
     for (const sessionId in sessions) {
@@ -114,10 +149,8 @@ socket.on('playback_position', ({ sessionId, position }) => {
         const other = session.host === socket ? session.guest : session.host;
         if (other) other.emit('partner_left', {});
         if (session.host === socket) {
-          // console.log(`Host ${socket.id} disconnected, deleting session ${sessionId}`);
           delete sessions[sessionId];
         } else {
-          // console.log(`Guest ${socket.id} disconnected from session ${sessionId}`);
           session.guest = null;
         }
       }
