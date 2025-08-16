@@ -136,6 +136,14 @@ io.on('connection', (socket) => {
     io.to(sessionId).emit('queue_updated', { queue: session.queue });
   });
 
+  // Add this handler:
+socket.on('update_queue', ({ sessionId, queue }) => {
+  const session = sessions[sessionId];
+  if (!session) return;
+  session.queue = queue;
+  io.to(sessionId).emit('queue_updated', { queue: session.queue });
+});
+
   socket.on('clear_queue', ({ sessionId }) => {
     const session = sessions[sessionId];
     if (!session) return;
