@@ -2,10 +2,32 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const { nanoid } = require('nanoid');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
+
+// Serve uploaded profile images
+app.use('/uploads', express.static('uploads'));
+
+// Multer setup for image uploads
+const upload = multer({ dest: 'uploads/' });
+
+// Endpoint for uploading profile images
+app.post('/upload-profile-image', upload.single('image'), (req, res) => {
+  if (!req.file) return res.status(400).send('No file uploaded.');
+
+  // Rename file to preserve extension and make it unique
+  const ext = path.extname(req.file.originalname);
+  const newFilename = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+  fs.renameSync(req.file.path, `uploads/${newFilename}`);
+
+  // Return public URL
+  res.json({ url: `${req.protocol}://${req.get('host')}/uploads/${newFilename}` });
+});
 
 // Add profiles to each session
 // sessions[sessionId] = { host, guest, ready, pendingSong, queue, profiles: {host: {...}, guest: {...}} }
@@ -61,6 +83,8 @@ io.on('connection', (socket) => {
   });
 
   // Receive client profile and update session
+  // The client must first POST the image file to /upload-profile-image and get back a public URL.
+  // Then, the client should send that URL as `profileImagePath` in send_profile.
   socket.on('send_profile', ({ username, profileImagePath }) => {
     for (const sessionId in sessions) {
       const session = sessions[sessionId];
