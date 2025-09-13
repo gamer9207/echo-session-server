@@ -2,10 +2,31 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const { nanoid } = require('nanoid');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
+
+// --- NEW: Serve uploaded profile images ---
+app.use('/uploads', express.static('uploads'));
+
+// --- NEW: Multer setup for image uploads ---
+const upload = multer({ dest: 'uploads/' });
+
+app.post('/upload-profile-image', upload.single('image'), (req, res) => {
+  if (!req.file) return res.status(400).send('No file uploaded.');
+
+  // Optionally, rename file for uniqueness and preserve extension
+  const ext = path.extname(req.file.originalname);
+  const newFilename = `${Date.now()}-${Math.round(Math.random()*1E9)}${ext}`;
+  fs.renameSync(req.file.path, `uploads/${newFilename}`);
+
+  // Return public URL for client to use
+  res.json({ url: `${req.protocol}://${req.get('host')}/uploads/${newFilename}` });
+});
 
 // Add profiles to each session
 // sessions[sessionId] = { host, guest, ready, pendingSong, queue, profiles: {host: {...}, guest: {...}} }
@@ -61,6 +82,7 @@ io.on('connection', (socket) => {
   });
 
   // Receive client profile and update session
+  // profileImagePath should be a URL, not a local file path!
   socket.on('send_profile', ({ username, profileImagePath }) => {
     for (const sessionId in sessions) {
       const session = sessions[sessionId];
