@@ -2,8 +2,9 @@
   "name": "echo-session-server",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
+    "start": "node server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -14,7 +15,7 @@
     "nanoid": "^5.1.5",
     "socket.io": "^4.8.1",
     "uuid": "^11.1.0",
-    "ws": "^8.18.3"
+    "ws": "^8.18.3",
     "multer": "^1.4.5-lts.1"
   }
 }
