@@ -7,7 +7,9 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-const sessions = {}; // sessionId -> { host, guest, ready, pendingSong, queue }
+// Add profiles to each session
+// sessions[sessionId] = { host, guest, ready, pendingSong, queue, profiles: {host: {...}, guest: {...}} }
+const sessions = {}; // sessionId -> { host, guest, ready, pendingSong, queue, profiles }
 
 app.get('/', (req, res) => {
   res.send('Echo Session Server is running!');
@@ -23,7 +25,8 @@ io.on('connection', (socket) => {
       guest: null,
       ready: { host: false, guest: false },
       pendingSong: null,
-      queue: []
+      queue: [],
+      profiles: { host: null, guest: null }, // <-- profile info
     };
     socket.join(sessionId);
     socket.emit('session_created', { sessionId });
@@ -49,7 +52,26 @@ io.on('connection', (socket) => {
     socket.emit('session_joined', { sessionId });
     // Send current queue to new guest
     socket.emit('queue_updated', { queue: session.queue });
+
+    // If profiles exist, send to both
+    if (session.profiles.host || session.profiles.guest) {
+      io.to(sessionId).emit('profiles_updated', session.profiles);
+    }
     console.log(`Socket ${socket.id} joined session ${sessionId}`);
+  });
+
+  // Receive client profile and update session
+  socket.on('send_profile', ({ username, profileImagePath }) => {
+    for (const sessionId in sessions) {
+      const session = sessions[sessionId];
+      if (session.host === socket) {
+        session.profiles.host = { username, profileImagePath };
+        io.to(sessionId).emit('profiles_updated', session.profiles);
+      } else if (session.guest === socket) {
+        session.profiles.guest = { username, profileImagePath };
+        io.to(sessionId).emit('profiles_updated', session.profiles);
+      }
+    }
   });
 
   // Playback events: play, pause, seek, etc.
@@ -166,6 +188,9 @@ io.on('connection', (socket) => {
       delete sessions[sessionId];
     } else {
       session.guest = null;
+      // Remove guest profile
+      session.profiles.guest = null;
+      io.to(sessionId).emit('profiles_updated', session.profiles);
     }
     socket.leave(sessionId);
   });
@@ -186,6 +211,9 @@ io.on('connection', (socket) => {
           delete sessions[sessionId];
         } else {
           session.guest = null;
+          // Remove guest profile
+          session.profiles.guest = null;
+          io.to(sessionId).emit('profiles_updated', session.profiles);
         }
       }
     }
