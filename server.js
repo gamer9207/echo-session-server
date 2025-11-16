@@ -17,6 +17,9 @@ const io = new Server(server, { cors: { origin: "*" } });
 // }
 const sessions = {}; // sessionId -> session object
 
+// milliseconds to schedule the synchronized start in the future to allow buffering
+const START_DELAY_MS = 800;
+
 app.get('/', (req, res) => {
   res.send('Echo Session Server is running!');
 });
@@ -113,7 +116,8 @@ io.on('connection', (socket) => {
   });
 
   // Change song event sync: selector initiates song change.
-  // We will record who selected, stop the other peer immediately and notify only the other peer to prepare.
+  // We will compute a startAt and notify both peers to prepare instantly, stop current playback,
+  // wait for both ready_for_play, then emit sync_play (with startAt) for simultaneous start.
   // payload: { sessionId, data: { song, position, sentAt? } }
   socket.on('change_song', (payload) => {
     try {
@@ -124,30 +128,45 @@ io.on('connection', (socket) => {
       const session = sessions[sessionId];
       if (!session) return;
 
-      // store pendingSong and reset ready flags
-      session.pendingSong = data;
-      session.ready = { host: false, guest: false };
-
       // record who selected: 'host' or 'guest'
       if (session.host === socket) session.lastSelector = 'host';
       else if (session.guest === socket) session.lastSelector = 'guest';
       else session.lastSelector = null;
 
-      // Immediately tell the other peer to stop current playback so host selection is effective instantly
-      if (session.host === socket && session.guest) {
-        try { session.guest.emit('stop'); } catch (_) {}
-        // host selected -> tell guest only to prepare
-        try { session.guest.emit('prepare_song', { data }); } catch (_) {}
-      } else if (session.guest === socket && session.host) {
-        try { session.host.emit('stop'); } catch (_) {}
-        // guest selected -> tell host only to prepare
-        try { session.host.emit('prepare_song', { data }); } catch (_) {}
-      } else {
-        // No paired peer yet: nothing to notify right now
-      }
+      // Compute planned absolute start time for synchronized playback
+      const nowMs = Date.now();
+      const startAt = nowMs + START_DELAY_MS;
 
-      // Note: selector is expected to locally start playing immediately and emit playback_event (play) with sentAt.
-      console.log(`change_song from ${session.lastSelector} in session ${sessionId}`);
+      // Store pending song with scheduled start
+      session.pendingSong = {
+        song: data.song,
+        position: data.position ?? 0,
+        sentAt: data.sentAt ?? nowMs,
+        startAt,
+        selector: session.lastSelector,
+      };
+
+      // Reset ready flags
+      session.ready = { host: false, guest: false };
+
+      // Immediately tell both clients to stop current playback (so UI/player reflects change instantly)
+      try { if (session.host) session.host.emit('stop'); } catch (_) {}
+      try { if (session.guest) session.guest.emit('stop'); } catch (_) {}
+
+      // Immediately tell both clients to prepare the pending song (this updates UI/queue instantly)
+      const preparePayload = {
+        data: {
+          song: session.pendingSong.song,
+          position: session.pendingSong.position,
+          sentAt: session.pendingSong.sentAt,
+          startAt: session.pendingSong.startAt,
+          selector: session.pendingSong.selector,
+        }
+      };
+      try { if (session.host) session.host.emit('prepare_song', preparePayload); } catch (_) {}
+      try { if (session.guest) session.guest.emit('prepare_song', preparePayload); } catch (_) {}
+
+      console.log(`change_song from ${session.lastSelector} in session ${sessionId}, startAt=${startAt}`);
     } catch (e) {
       console.error('change_song handler error:', e);
     }
@@ -168,23 +187,20 @@ io.on('connection', (socket) => {
         session.ready.guest = true;
       }
 
-      // When both are ready, instruct only the non-selector to start playing (selector already started).
-      // Include the selector-provided position and sentAt if available to help latency compensation.
+      // When both are ready, instruct both to start playing at the scheduled startAt time
       if (session.ready.host && session.ready.guest) {
-        const selector = session.lastSelector; // 'host' or 'guest'
-        const payloadToSend = {
-          data: session.pendingSong,
-          // The pendingSong may include position and sentAt if the selector provided them.
+        const syncPayload = {
+          data: {
+            song: session.pendingSong.song,
+            position: session.pendingSong.position,
+            sentAt: session.pendingSong.sentAt,
+            startAt: session.pendingSong.startAt,
+            selector: session.pendingSong.selector
+          }
         };
-        if (selector === 'host') {
-          if (session.guest) session.guest.emit('sync_play', payloadToSend);
-        } else if (selector === 'guest') {
-          if (session.host) session.host.emit('sync_play', payloadToSend);
-        } else {
-          // fallback: if unknown, emit to both
-          if (session.host) session.host.emit('sync_play', payloadToSend);
-          if (session.guest) session.guest.emit('sync_play', payloadToSend);
-        }
+        // Emit sync_play to both (both should schedule playback at startAt)
+        try { if (session.host) session.host.emit('sync_play', syncPayload); } catch (_) {}
+        try { if (session.guest) session.guest.emit('sync_play', syncPayload); } catch (_) {}
 
         // Clear pending state
         session.pendingSong = null;
@@ -197,7 +213,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Auto-sync: forward playback_position (full payload preserved)
+  // Auto-sync / direct playback events forwarded to other peer
   socket.on('playback_position', (payload) => {
     try {
       if (!payload || typeof payload !== 'object') return;
@@ -205,7 +221,6 @@ io.on('connection', (socket) => {
       if (!sessionId) return;
       const session = sessions[sessionId];
       if (!session) return;
-
       if (session.host === socket && session.guest) {
         session.guest.emit('playback_position', payload);
       } else if (session.guest === socket && session.host) {
