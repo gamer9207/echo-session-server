@@ -8,8 +8,13 @@ const server = http.createServer(app);
 // allow CORS from any origin for now (you can restrict in production)
 const io = new Server(server, { cors: { origin: "*" } });
 
-// sessions[sessionId] = { host, guest, ready, pendingSong, queue, profiles: {host: {...}, guest: {...}} }
-const sessions = {}; // sessionId -> { host, guest, ready, pendingSong, queue, profiles }
+// sessions[sessionId] = {
+//   host, guest,
+//   ready: { host: bool, guest: bool },
+//   pendingSong, queue, profiles: { host: {...}, guest: {...} },
+//   lastSelector: 'host'|'guest'|null
+// }
+const sessions = {}; // sessionId -> session object
 
 app.get('/', (req, res) => {
   res.send('Echo Session Server is running!');
@@ -26,7 +31,8 @@ io.on('connection', (socket) => {
       ready: { host: false, guest: false },
       pendingSong: null,
       queue: [],
-      profiles: { host: null, guest: null }, // <-- profile info
+      profiles: { host: null, guest: null },
+      lastSelector: null,
     };
     socket.join(sessionId);
     socket.emit('session_created', { sessionId });
@@ -54,14 +60,10 @@ io.on('connection', (socket) => {
     }
     session.guest = socket;
     socket.join(sessionId);
-    // Notify host
     try { session.host.emit('guest_joined', {}); } catch (_) {}
-    // Notify guest of join
     socket.emit('session_joined', { sessionId });
-    // Send current queue to new guest
     socket.emit('queue_updated', { queue: session.queue });
 
-    // If profiles exist, send to both
     if (session.profiles.host || session.profiles.guest) {
       io.to(sessionId).emit('profiles_updated', session.profiles);
     }
@@ -69,18 +71,12 @@ io.on('connection', (socket) => {
   });
 
   // Receive client profile and update session
-  // Accept either two args or an object: ('send_profile', { username, profileImagePath })
+  // payload: { username, profileImagePath }
   socket.on('send_profile', (payload) => {
-    let username = null;
-    let profileImagePath = null;
+    if (!payload || typeof payload !== 'object') return;
+    const username = payload.username;
+    const profileImagePath = payload.profileImagePath;
 
-    if (!payload) return;
-    if (typeof payload === 'object') {
-      username = payload.username;
-      profileImagePath = payload.profileImagePath;
-    }
-
-    // loop through sessions and update profile belonging to this socket
     for (const sessionId in sessions) {
       const session = sessions[sessionId];
       if (session.host === socket) {
@@ -95,8 +91,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Playback events: play, pause, seek, etc.
-  // Forward the entire payload to preserve fields like 'sentAt' and 'data'
+  // Playback events: forward entire payload so sentAt etc. preserved
   socket.on('playback_event', (payload) => {
     try {
       if (!payload || typeof payload !== 'object') return;
@@ -105,7 +100,6 @@ io.on('connection', (socket) => {
       const session = sessions[sessionId];
       if (!session) return;
 
-      // forward the whole payload
       if (session.host === socket && session.guest) {
         session.guest.emit('playback_event', payload);
       } else if (session.guest === socket && session.host) {
@@ -116,8 +110,9 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Change song event sync: now saves for sync protocol
-  // Expect payload: { sessionId, data: { song, position } } (keeps compatibility)
+  // Change song event sync: selector initiates song change.
+  // We will record who selected and notify only the other peer to prepare.
+  // payload: { sessionId, data: { song, position } }
   socket.on('change_song', (payload) => {
     try {
       if (!payload || typeof payload !== 'object') return;
@@ -127,11 +122,29 @@ io.on('connection', (socket) => {
       const session = sessions[sessionId];
       if (!session) return;
 
+      // store pendingSong and reset ready flags
       session.pendingSong = data;
-      session.ready.host = false;
-      session.ready.guest = false;
-      if (session.host) session.host.emit('prepare_song', { data });
-      if (session.guest) session.guest.emit('prepare_song', { data });
+      session.ready = { host: false, guest: false };
+
+      // record who selected: 'host' or 'guest'
+      if (session.host === socket) session.lastSelector = 'host';
+      else if (session.guest === socket) session.lastSelector = 'guest';
+      else session.lastSelector = null;
+
+      // Notify only the other client to prepare (not the selector)
+      if (session.host === socket && session.guest) {
+        // host selected -> tell guest only
+        session.guest.emit('prepare_song', { data });
+      } else if (session.guest === socket && session.host) {
+        // guest selected -> tell host only
+        session.host.emit('prepare_song', { data });
+      } else {
+        // No paired peer yet: nothing to notify right now
+      }
+
+      // Note: selector is expected to locally start playing immediately and emit ready_for_play,
+      // which the server will record. When both ready flags true, server will tell the non-selector to sync_play.
+      console.log(`change_song from ${session.lastSelector} in session ${sessionId}`);
     } catch (e) {
       console.error('change_song handler error:', e);
     }
@@ -152,20 +165,33 @@ io.on('connection', (socket) => {
         session.ready.guest = true;
       }
 
+      // When both are ready, instruct only the non-selector to start playing (selector already started)
       if (session.ready.host && session.ready.guest) {
-        if (session.host) session.host.emit('sync_play', { data: session.pendingSong });
-        if (session.guest) session.guest.emit('sync_play', { data: session.pendingSong });
+        const selector = session.lastSelector; // 'host' or 'guest'
+        if (selector === 'host') {
+          // host selected -> tell guest to sync_play
+          if (session.guest) session.guest.emit('sync_play', { data: session.pendingSong });
+        } else if (selector === 'guest') {
+          // guest selected -> tell host to sync_play
+          if (session.host) session.host.emit('sync_play', { data: session.pendingSong });
+        } else {
+          // fallback: if unknown, emit to both
+          if (session.host) session.host.emit('sync_play', { data: session.pendingSong });
+          if (session.guest) session.guest.emit('sync_play', { data: session.pendingSong });
+        }
+
+        // Clear pending state
         session.pendingSong = null;
         session.ready.host = false;
         session.ready.guest = false;
+        session.lastSelector = null;
       }
     } catch (e) {
       console.error('ready_for_play handler error:', e);
     }
   });
 
-  // --- Auto-sync: relay playback position between clients ---
-  // Forward the entire payload so sentAt is preserved (if provided)
+  // Auto-sync: forward playback_position (full payload preserved)
   socket.on('playback_position', (payload) => {
     try {
       if (!payload || typeof payload !== 'object') return;
@@ -174,7 +200,6 @@ io.on('connection', (socket) => {
       const session = sessions[sessionId];
       if (!session) return;
 
-      // forward the whole payload
       if (session.host === socket && session.guest) {
         session.guest.emit('playback_position', payload);
       } else if (session.guest === socket && session.host) {
@@ -185,7 +210,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- Common queue sync ---
+  // --- Queue sync handlers (payload objects expected) ---
   socket.on('add_to_queue', (payload) => {
     try {
       if (!payload || typeof payload !== 'object') return;
@@ -195,7 +220,6 @@ io.on('connection', (socket) => {
       console.log('Received add_to_queue', sessionId, song);
       const session = sessions[sessionId];
       if (!session) return;
-      // Prevent duplicates
       if (!session.queue.some(s => s.videoId === song.videoId)) {
         session.queue.push(song);
       }
@@ -274,7 +298,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Explicit leave event from client
+  // Explicit leave event
   socket.on('leave_session', (payload) => {
     try {
       if (!payload || typeof payload !== 'object') return;
@@ -291,7 +315,6 @@ io.on('connection', (socket) => {
         delete sessions[sessionId];
       } else {
         session.guest = null;
-        // Remove guest profile
         session.profiles.guest = null;
         io.to(sessionId).emit('profiles_updated', session.profiles);
       }
@@ -301,7 +324,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Enhanced disconnect logic: let peer know who left/ended
+  // Disconnect handling similar to leave
   socket.on('disconnect', () => {
     for (const sessionId in sessions) {
       const session = sessions[sessionId];
