@@ -1,7 +1,6 @@
 // server.js
-// Patch: avoid repeated prepare/sync for the same pending song. If the incoming change_song
-// is the same song already pending and selected by same peer, ignore it (no duplicate notify).
-// This ensures we only notify peers once per song change.
+// Adds time sync response and attaches serverTime to forwarded playback_event.
+// Keeps the existing synchronized startAt logic.
 
 const express = require('express');
 const http = require('http');
@@ -30,6 +29,16 @@ app.get('/', (req, res) => {
 
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
+
+  // --- Time sync handler: client sends { clientTime }, server replies with serverTime and echo
+  socket.on('time_sync_request', (payload) => {
+    try {
+      const clientTime = payload && payload.clientTime ? payload.clientTime : null;
+      socket.emit('time_sync_response', { clientTime, serverTime: Date.now() });
+    } catch (e) {
+      console.error('time_sync_request error:', e);
+    }
+  });
 
   socket.on('create_session', () => {
     const sessionId = nanoid(10);
@@ -100,6 +109,7 @@ io.on('connection', (socket) => {
   });
 
   // Playback events: forward entire payload so sentAt etc. preserved
+  // Attach serverTime so receivers have a consistent time base
   socket.on('playback_event', (payload) => {
     try {
       if (!payload || typeof payload !== 'object') return;
@@ -108,11 +118,14 @@ io.on('connection', (socket) => {
       const session = sessions[sessionId];
       if (!session) return;
 
+      // attach serverTime
+      const augmented = Object.assign({}, payload, { serverTime: Date.now() });
+
       // forward the whole payload immediately so sync is instant
       if (session.host === socket && session.guest) {
-        session.guest.emit('playback_event', payload);
+        session.guest.emit('playback_event', augmented);
       } else if (session.guest === socket && session.host) {
-        session.host.emit('playback_event', payload);
+        session.host.emit('playback_event', augmented);
       }
     } catch (e) {
       console.error('playback_event handler error:', e);
