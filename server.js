@@ -1,4 +1,8 @@
 // server.js
+// Patch: avoid repeated prepare/sync for the same pending song. If the incoming change_song
+// is the same song already pending and selected by same peer, ignore it (no duplicate notify).
+// This ensures we only notify peers once per song change.
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -118,6 +122,7 @@ io.on('connection', (socket) => {
   // Change song event sync: selector initiates song change.
   // We will compute a startAt and notify both peers to prepare instantly, stop current playback,
   // wait for both ready_for_play, then emit sync_play (with startAt) for simultaneous start.
+  // Avoid re-notifying if the same pending song is already scheduled by the same selector.
   // payload: { sessionId, data: { song, position, sentAt? } }
   socket.on('change_song', (payload) => {
     try {
@@ -128,9 +133,28 @@ io.on('connection', (socket) => {
       const session = sessions[sessionId];
       if (!session) return;
 
+      // identify selector
+      const selector = (session.host === socket) ? 'host' : (session.guest === socket ? 'guest' : null);
+
+      const incomingSong = data.song;
+      const incomingVideoId = incomingSong && incomingSong.videoId ? incomingSong.videoId : null;
+
+      // If same pendingSong exists and it was selected by same selector and same videoId,
+      // treat this as duplicate and ignore to avoid repeated prepare notifications.
+      if (session.pendingSong && session.pendingSong.song && incomingVideoId) {
+        try {
+          const pendingVid = session.pendingSong.song.videoId;
+          const pendingSelector = session.pendingSong.selector;
+          if (pendingVid === incomingVideoId && pendingSelector === selector) {
+            console.log(`Ignoring duplicate change_song for same song ${incomingVideoId} by ${selector} in session ${sessionId}`);
+            return;
+          }
+        } catch (_) {}
+      }
+
       // record who selected: 'host' or 'guest'
-      if (session.host === socket) session.lastSelector = 'host';
-      else if (session.guest === socket) session.lastSelector = 'guest';
+      if (selector === 'host') session.lastSelector = 'host';
+      else if (selector === 'guest') session.lastSelector = 'guest';
       else session.lastSelector = null;
 
       // Compute planned absolute start time for synchronized playback
@@ -149,7 +173,7 @@ io.on('connection', (socket) => {
       // Reset ready flags
       session.ready = { host: false, guest: false };
 
-      // Immediately tell both clients to stop current playback (so UI/player reflects change instantly)
+      // Immediately tell both clients to stop current playback so UI/player reflects change instantly
       try { if (session.host) session.host.emit('stop'); } catch (_) {}
       try { if (session.guest) session.guest.emit('stop'); } catch (_) {}
 
