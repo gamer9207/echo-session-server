@@ -1,7 +1,3 @@
-// server.js
-// Improved: include serverTime in prepare/sync/play payloads, add pendingSong timeout cleanup,
-// attach serverTime to playback_position, more defensive validation and logging.
-
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -9,20 +5,11 @@ const { nanoid } = require('nanoid');
 
 const app = express();
 const server = http.createServer(app);
-// allow CORS from any origin for now (you can restrict in production)
 const io = new Server(server, { cors: { origin: "*" } });
 
-// sessions[sessionId] = {
-//   host, guest,
-//   ready: { host, guest },
-//   pendingSong, pendingTimer, queue, profiles, lastSelector
-// }
-const sessions = {}; // sessionId -> session object
-
-// milliseconds to schedule the synchronized start in the future to allow buffering
-const START_DELAY_MS = parseInt(process.env.START_DELAY_MS || '800', 10);
-// how long we keep a pendingSong before cancelling (ms)
-const PENDING_SONG_TIMEOUT_MS = 20 * 1000;
+// Add profiles to each session
+// sessions[sessionId] = { host, guest, ready, pendingSong, queue, profiles: {host: {...}, guest: {...}} }
+const sessions = {}; // sessionId -> { host, guest, ready, pendingSong, queue, profiles }
 
 app.get('/', (req, res) => {
   res.send('Echo Session Server is running!');
@@ -31,16 +18,6 @@ app.get('/', (req, res) => {
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
 
-  // --- Time sync handler: client sends { clientTime }, server replies with serverTime and echo
-  socket.on('time_sync_request', (payload) => {
-    try {
-      const clientTime = payload && payload.clientTime ? payload.clientTime : null;
-      socket.emit('time_sync_response', { clientTime, serverTime: Date.now() });
-    } catch (e) {
-      console.error('time_sync_request error:', e);
-    }
-  });
-
   socket.on('create_session', () => {
     const sessionId = nanoid(10);
     sessions[sessionId] = {
@@ -48,26 +25,16 @@ io.on('connection', (socket) => {
       guest: null,
       ready: { host: false, guest: false },
       pendingSong: null,
-      pendingTimer: null,
       queue: [],
-      profiles: { host: null, guest: null },
-      lastSelector: null,
+      profiles: { host: null, guest: null }, // <-- profile info
     };
     socket.join(sessionId);
     socket.emit('session_created', { sessionId });
     console.log(`Session created: ${sessionId} by socket ${socket.id}`);
   });
 
-  // Accept either an object { sessionId } or a plain string (legacy)
-  socket.on('join_session', (payload) => {
-    let sessionId = null;
-    if (!payload) {
-      socket.emit('invalid_session', { message: 'Missing sessionId.' });
-      return;
-    }
-    if (typeof payload === 'string') sessionId = payload;
-    else sessionId = payload.sessionId;
-
+  // Improved: send invalid_session for wrong code, and session_full
+  socket.on('join_session', ({ sessionId }) => {
     const session = sessions[sessionId];
     if (!session) {
       socket.emit('invalid_session', { message: 'Invalid session code.' });
@@ -79,10 +46,14 @@ io.on('connection', (socket) => {
     }
     session.guest = socket;
     socket.join(sessionId);
-    try { session.host.emit('guest_joined', {}); } catch (err) { console.warn('guest_joined emit failed', err); }
+    // Notify host
+    session.host.emit('guest_joined', {});
+    // Notify guest of join
     socket.emit('session_joined', { sessionId });
+    // Send current queue to new guest
     socket.emit('queue_updated', { queue: session.queue });
 
+    // If profiles exist, send to both
     if (session.profiles.host || session.profiles.guest) {
       io.to(sessionId).emit('profiles_updated', session.profiles);
     }
@@ -90,327 +61,143 @@ io.on('connection', (socket) => {
   });
 
   // Receive client profile and update session
-  // payload: { username, profileImagePath }
-  socket.on('send_profile', (payload) => {
-    if (!payload || typeof payload !== 'object') return;
-    const username = payload.username;
-    const profileImagePath = payload.profileImagePath;
-
-    for (const sid in sessions) {
-      const s = sessions[sid];
-      if (s.host === socket) {
-        s.profiles.host = { username, profileImagePath };
-        io.to(sid).emit('profiles_updated', s.profiles);
-        break;
-      } else if (s.guest === socket) {
-        s.profiles.guest = { username, profileImagePath };
-        io.to(sid).emit('profiles_updated', s.profiles);
-        break;
+  socket.on('send_profile', ({ username, profileImagePath }) => {
+    for (const sessionId in sessions) {
+      const session = sessions[sessionId];
+      if (session.host === socket) {
+        session.profiles.host = { username, profileImagePath };
+        io.to(sessionId).emit('profiles_updated', session.profiles);
+      } else if (session.guest === socket) {
+        session.profiles.guest = { username, profileImagePath };
+        io.to(sessionId).emit('profiles_updated', session.profiles);
       }
     }
   });
 
-  // Playback events: forward entire payload so sentAt etc. preserved
-  // Attach serverTime so receivers have a consistent time base
-  socket.on('playback_event', (payload) => {
-    try {
-      if (!payload || typeof payload !== 'object') return;
-      const sessionId = payload.sessionId;
-      if (!sessionId) return;
-      const session = sessions[sessionId];
-      if (!session) return;
-
-      // attach serverTime
-      const augmented = Object.assign({}, payload, { serverTime: Date.now() });
-
-      // forward the whole payload immediately so sync is instant
-      if (session.host === socket && session.guest) {
-        session.guest.emit('playback_event', augmented);
-      } else if (session.guest === socket && session.host) {
-        session.host.emit('playback_event', augmented);
-      }
-    } catch (e) {
-      console.error('playback_event handler error:', e);
+  // Playback events: play, pause, seek, etc.
+  socket.on('playback_event', ({ sessionId, event, data, position }) => {
+    const session = sessions[sessionId];
+    if (!session) return;
+    const payload = { event, position, data };
+    if (session.host === socket && session.guest) {
+      session.guest.emit('playback_event', payload);
+    } else if (session.guest === socket && session.host) {
+      session.host.emit('playback_event', payload);
     }
   });
 
-  // Change song event sync: selector initiates song change.
-  socket.on('change_song', (payload) => {
-    try {
-      if (!payload || typeof payload !== 'object') return;
-      const sessionId = payload.sessionId;
-      const data = payload.data;
-      if (!sessionId || !data) return;
-      const session = sessions[sessionId];
-      if (!session) return;
-
-      // identify selector
-      const selector = (session.host === socket) ? 'host' : (session.guest === socket ? 'guest' : null);
-      const incomingSong = data.song;
-      const incomingVideoId = incomingSong && incomingSong.videoId ? incomingSong.videoId : null;
-
-      // If same pendingSong exists and it was selected by same selector and same videoId,
-      // treat this as duplicate and ignore to avoid repeated prepare notifications.
-      if (session.pendingSong && session.pendingSong.song && incomingVideoId) {
-        try {
-          const pendingVid = session.pendingSong.song.videoId;
-          const pendingSelector = session.pendingSong.selector;
-          if (pendingVid === incomingVideoId && pendingSelector === selector) {
-            console.log(`Ignoring duplicate change_song for same song ${incomingVideoId} by ${selector} in session ${sessionId}`);
-            return;
-          }
-        } catch (_) {}
-      }
-
-      // record who selected: 'host' or 'guest'
-      if (selector === 'host') session.lastSelector = 'host';
-      else if (selector === 'guest') session.lastSelector = 'guest';
-      else session.lastSelector = null;
-
-      // Compute planned absolute start time for synchronized playback (server epoch ms)
-      const nowMs = Date.now();
-      const startAt = nowMs + START_DELAY_MS;
-
-      // Clear any previous pending timeout
-      if (session.pendingTimer) {
-        clearTimeout(session.pendingTimer);
-        session.pendingTimer = null;
-      }
-
-      // Store pending song with scheduled start
-      session.pendingSong = {
-        song: data.song,
-        position: data.position ?? 0,
-        sentAt: data.sentAt ?? nowMs,
-        startAt,
-        selector: session.lastSelector,
-      };
-
-      // Reset ready flags
-      session.ready = { host: false, guest: false };
-
-      // Immediately tell both clients to stop current playback so UI/player reflects change instantly
-      try { if (session.host) session.host.emit('stop'); } catch (_) {}
-      try { if (session.guest) session.guest.emit('stop'); } catch (_) {}
-
-      // Immediately tell both clients to prepare the pending song (this updates UI/queue instantly)
-      const preparePayload = {
-        data: {
-          song: session.pendingSong.song,
-          position: session.pendingSong.position,
-          sentAt: session.pendingSong.sentAt,
-          startAt: session.pendingSong.startAt,
-          selector: session.pendingSong.selector,
-          serverTime: Date.now()
-        }
-      };
-      try { if (session.host) session.host.emit('prepare_song', preparePayload); } catch (_) {}
-      try { if (session.guest) session.guest.emit('prepare_song', preparePayload); } catch (_) {}
-
-      // Set a timeout to clear pendingSong if ready_for_play never comes
-      session.pendingTimer = setTimeout(() => {
-        try {
-          console.warn(`pendingSong timeout clearing for session ${sessionId}`);
-          // notify clients that pending song was cancelled
-          if (session.host) session.host.emit('pending_song_cancelled', { reason: 'timeout' });
-          if (session.guest) session.guest.emit('pending_song_cancelled', { reason: 'timeout' });
-        } catch (_) {}
-        session.pendingSong = null;
-        session.ready = { host: false, guest: false };
-        session.pendingTimer = null;
-        session.lastSelector = null;
-      }, PENDING_SONG_TIMEOUT_MS);
-
-      console.log(`change_song from ${session.lastSelector} in session ${sessionId}, startAt=${startAt}`);
-    } catch (e) {
-      console.error('change_song handler error:', e);
-    }
+  // Change song event sync: now saves for sync protocol
+  socket.on('change_song', ({ sessionId, data }) => {
+    const session = sessions[sessionId];
+    if (!session) return;
+    session.pendingSong = data;
+    session.ready.host = false;
+    session.ready.guest = false;
+    if (session.host) session.host.emit('prepare_song', { data });
+    if (session.guest) session.guest.emit('prepare_song', { data });
   });
 
   // Each client signals ready after buffering
-  socket.on('ready_for_play', (payload) => {
-    try {
-      if (!payload || typeof payload !== 'object') return;
-      const sessionId = payload.sessionId;
-      const session = sessions[sessionId];
-      if (!session || !session.pendingSong) return;
+  socket.on('ready_for_play', ({ sessionId }) => {
+    const session = sessions[sessionId];
+    if (!session || !session.pendingSong) return;
 
-      if (session.host === socket) {
-        session.ready.host = true;
-      } else if (session.guest === socket) {
-        session.ready.guest = true;
-      }
+    if (session.host === socket) {
+      session.ready.host = true;
+    } else if (session.guest === socket) {
+      session.ready.guest = true;
+    }
 
-      // When both are ready, instruct both to start playing at the scheduled startAt time
-      if (session.ready.host && session.ready.guest) {
-        // clear pending timeout
-        if (session.pendingTimer) {
-          clearTimeout(session.pendingTimer);
-          session.pendingTimer = null;
-        }
-
-        const syncPayload = {
-          data: {
-            song: session.pendingSong.song,
-            position: session.pendingSong.position,
-            sentAt: session.pendingSong.sentAt,
-            startAt: session.pendingSong.startAt,
-            selector: session.pendingSong.selector,
-            serverTime: Date.now()
-          }
-        };
-        // Emit sync_play to both (both should schedule playback at startAt)
-        try { if (session.host) session.host.emit('sync_play', syncPayload); } catch (_) {}
-        try { if (session.guest) session.guest.emit('sync_play', syncPayload); } catch (_) {}
-
-        // Clear pending state
-        session.pendingSong = null;
-        session.ready.host = false;
-        session.ready.guest = false;
-        session.lastSelector = null;
-      }
-    } catch (e) {
-      console.error('ready_for_play handler error:', e);
+    if (session.ready.host && session.ready.guest) {
+      if (session.host) session.host.emit('sync_play', { data: session.pendingSong });
+      if (session.guest) session.guest.emit('sync_play', { data: session.pendingSong });
+      session.pendingSong = null;
+      session.ready.host = false;
+      session.ready.guest = false;
     }
   });
 
-  // Auto-sync / direct playback events forwarded to other peer
-  socket.on('playback_position', (payload) => {
-    try {
-      if (!payload || typeof payload !== 'object') return;
-      const sessionId = payload.sessionId;
-      if (!sessionId) return;
-      const session = sessions[sessionId];
-      if (!session) return;
-
-      // attach serverTime for better compensation at receiver
-      const augmented = Object.assign({}, payload, { serverTime: Date.now() });
-
-      if (session.host === socket && session.guest) {
-        session.guest.emit('playback_position', augmented);
-      } else if (session.guest === socket && session.host) {
-        session.host.emit('playback_position', augmented);
-      }
-    } catch (e) {
-      console.error('playback_position handler error:', e);
+  // --- Auto-sync: relay playback position between clients ---
+  // Accept optional 'duration' (ms) in addition to 'position'.
+  socket.on('playback_position', ({ sessionId, position, duration }) => {
+    const session = sessions[sessionId];
+    if (!session) return;
+    // Only relay host -> guest (same as before)
+    if (session.host === socket && session.guest) {
+      session.guest.emit('playback_position', { position, duration });
     }
   });
 
-  // --- Queue sync handlers (payload objects expected) ---
-  socket.on('add_to_queue', (payload) => {
-    try {
-      if (!payload || typeof payload !== 'object') return;
-      const sessionId = payload.sessionId;
-      const song = payload.song;
-      if (!sessionId || !song) return;
-      console.log('Received add_to_queue', sessionId, song);
-      const session = sessions[sessionId];
-      if (!session) return;
-      if (!session.queue.some(s => s.videoId === song.videoId)) {
-        session.queue.push(song);
-      }
-      io.to(sessionId).emit('queue_updated', { queue: session.queue });
-    } catch (e) {
-      console.error('add_to_queue handler error:', e);
+  // --- Common queue sync ---
+  socket.on('add_to_queue', ({ sessionId, song }) => {
+    console.log('Received add_to_queue', sessionId, song);
+    const session = sessions[sessionId];
+    if (!session) return;
+    // Prevent duplicates
+    if (!session.queue.some(s => s.videoId === song.videoId)) {
+      session.queue.push(song);
     }
+    io.to(sessionId).emit('queue_updated', { queue: session.queue });
   });
 
-  socket.on('remove_from_queue', (payload) => {
-    try {
-      if (!payload || typeof payload !== 'object') return;
-      const sessionId = payload.sessionId;
-      const videoId = payload.videoId;
-      if (!sessionId || !videoId) return;
-      const session = sessions[sessionId];
-      if (!session) return;
-      session.queue = session.queue.filter(s => s.videoId !== videoId);
-      io.to(sessionId).emit('queue_updated', { queue: session.queue });
-    } catch (e) {
-      console.error('remove_from_queue handler error:', e);
-    }
+  socket.on('remove_from_queue', ({ sessionId, videoId }) => {
+    const session = sessions[sessionId];
+    if (!session) return;
+    session.queue = session.queue.filter(s => s.videoId !== videoId);
+    io.to(sessionId).emit('queue_updated', { queue: session.queue });
   });
 
-  socket.on('move_in_queue', (payload) => {
-    try {
-      if (!payload || typeof payload !== 'object') return;
-      const sessionId = payload.sessionId;
-      const oldIndex = payload.oldIndex;
-      const newIndex = payload.newIndex;
-      if (typeof oldIndex !== 'number' || typeof newIndex !== 'number') return;
-      const session = sessions[sessionId];
-      if (!session) return;
-      const queue = session.queue;
-      if (
-        oldIndex < 0 ||
-        oldIndex >= queue.length ||
-        newIndex < 0 ||
-        newIndex > queue.length
-      ) return;
-      const [song] = queue.splice(oldIndex, 1);
-      queue.splice(newIndex, 0, song);
-      session.queue = queue;
-      io.to(sessionId).emit('queue_updated', { queue: session.queue });
-    } catch (e) {
-      console.error('move_in_queue handler error:', e);
-    }
+  socket.on('move_in_queue', ({ sessionId, oldIndex, newIndex }) => {
+    const session = sessions[sessionId];
+    if (!session) return;
+    const queue = session.queue;
+    if (
+      oldIndex < 0 ||
+      oldIndex >= queue.length ||
+      newIndex < 0 ||
+      newIndex > queue.length
+    ) return;
+    const [song] = queue.splice(oldIndex, 1);
+    queue.splice(newIndex, 0, song);
+    session.queue = queue;
+    io.to(sessionId).emit('queue_updated', { queue: session.queue });
   });
 
-  socket.on('update_queue', (payload) => {
-    try {
-      if (!payload || typeof payload !== 'object') return;
-      const sessionId = payload.sessionId;
-      const queue = payload.queue;
-      if (!sessionId || !Array.isArray(queue)) return;
-      const session = sessions[sessionId];
-      if (!session) return;
-      session.queue = queue;
-      io.to(sessionId).emit('queue_updated', { queue: session.queue });
-    } catch (e) {
-      console.error('update_queue handler error:', e);
-    }
+  socket.on('update_queue', ({ sessionId, queue }) => {
+    const session = sessions[sessionId];
+    if (!session) return;
+    session.queue = queue;
+    io.to(sessionId).emit('queue_updated', { queue: session.queue });
   });
 
-  socket.on('clear_queue', (payload) => {
-    try {
-      if (!payload || typeof payload !== 'object') return;
-      const sessionId = payload.sessionId;
-      if (!sessionId) return;
-      const session = sessions[sessionId];
-      if (!session) return;
-      session.queue = [];
-      io.to(sessionId).emit('queue_updated', { queue: session.queue });
-    } catch (e) {
-      console.error('clear_queue handler error:', e);
-    }
+  socket.on('clear_queue', ({ sessionId }) => {
+    const session = sessions[sessionId];
+    if (!session) return;
+    session.queue = [];
+    io.to(sessionId).emit('queue_updated', { queue: session.queue });
   });
 
-  // Explicit leave event
-  socket.on('leave_session', (payload) => {
-    try {
-      if (!payload || typeof payload !== 'object') return;
-      const sessionId = payload.sessionId;
-      if (!sessionId) return;
-      const session = sessions[sessionId];
-      if (!session) return;
-      const isHost = session.host === socket;
-      const other = isHost ? session.guest : session.host;
-      if (other) {
-        other.emit('partner_left', { by: isHost ? 'host' : 'guest' });
-      }
-      if (isHost) {
-        delete sessions[sessionId];
-      } else {
-        session.guest = null;
-        session.profiles.guest = null;
-        io.to(sessionId).emit('profiles_updated', session.profiles);
-      }
-      socket.leave(sessionId);
-    } catch (e) {
-      console.error('leave_session handler error:', e);
+  // Explicit leave event from client
+  socket.on('leave_session', ({ sessionId }) => {
+    const session = sessions[sessionId];
+    if (!session) return;
+    const isHost = session.host === socket;
+    const other = isHost ? session.guest : session.host;
+    if (other) {
+      other.emit('partner_left', { by: isHost ? 'host' : 'guest' });
     }
+    if (isHost) {
+      delete sessions[sessionId];
+    } else {
+      session.guest = null;
+      // Remove guest profile
+      session.profiles.guest = null;
+      io.to(sessionId).emit('profiles_updated', session.profiles);
+    }
+    socket.leave(sessionId);
   });
 
-  // Disconnect handling similar to leave
+  // Enhanced disconnect logic: let peer know who left/ended
   socket.on('disconnect', () => {
     for (const sessionId in sessions) {
       const session = sessions[sessionId];
@@ -418,12 +205,15 @@ io.on('connection', (socket) => {
         const isHost = session.host === socket;
         const other = isHost ? session.guest : session.host;
         if (other) {
+          // If host disconnected, guest should see "host ended the session"
+          // If guest disconnected, host should see "session has ended"
           other.emit('partner_left', { by: isHost ? 'host' : 'guest' });
         }
         if (isHost) {
           delete sessions[sessionId];
         } else {
           session.guest = null;
+          // Remove guest profile
           session.profiles.guest = null;
           io.to(sessionId).emit('profiles_updated', session.profiles);
         }
