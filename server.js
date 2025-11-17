@@ -118,13 +118,11 @@ io.on('connection', (socket) => {
   });
 
   // --- Auto-sync: relay playback position between clients ---
-  // Accept optional 'duration' (ms) in addition to 'position'.
-  socket.on('playback_position', ({ sessionId, position, duration }) => {
+  socket.on('playback_position', ({ sessionId, position }) => {
     const session = sessions[sessionId];
     if (!session) return;
-    // Only relay host -> guest (same as before)
     if (session.host === socket && session.guest) {
-      session.guest.emit('playback_position', { position, duration });
+      session.guest.emit('playback_position', { position });
     }
   });
 
@@ -226,3 +224,4 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`Socket.io server listening on port ${PORT}`);
 });
+
