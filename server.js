@@ -34,7 +34,9 @@ io.on('connection', (socket) => {
       pendingSong: null,
       queue: [],
       profiles: { host: null, guest: null },
-      playbackState: { playing: false, positionMs: 0 }
+      playbackState: { playing: false, positionMs: 0 },
+      currentSongs: { host: null, guest: null },  // NEW: track current songs
+      songSyncIntervals: {}  // NEW: store interval IDs for cleanup
     };
 
     socket.join(sessionId);
@@ -66,6 +68,9 @@ io.on('connection', (socket) => {
       io.to(sessionId).emit('profiles_updated', session.profiles);
     }
 
+    // NEW: Start the 3-second sync interval for this session
+    _startSongSyncInterval(sessionId, io);
+
     console.log(`[${sessionId}] Socket ${socket.id} joined as guest`);
   });
 
@@ -82,6 +87,20 @@ io.on('connection', (socket) => {
         io.to(sessionId).emit('profiles_updated', session.profiles);
       }
     }
+  });
+
+  // NEW: Track current song on host/guest
+  socket.on('update_current_song', ({ sessionId, song, durationMs }) => {
+    const session = sessions[sessionId];
+    if (!session) return;
+
+    if (session.host === socket.id) {
+      session.currentSongs.host = { song, durationMs, updatedAt: Date.now() };
+    } else if (session.guest === socket.id) {
+      session.currentSongs.guest = { song, durationMs, updatedAt: Date.now() };
+    }
+
+    console.log(`[${sessionId}] Current song updated`);
   });
 
   // PLAYBACK EVENTS - BROADCAST TO BOTH PEERS
@@ -223,6 +242,12 @@ io.on('connection', (socket) => {
     const isHost = session.host === socket.id;
     const otherSocketId = isHost ? session.guest : session.host;
 
+    // NEW: Clear sync interval when leaving
+    if (session.songSyncIntervals[sessionId]) {
+      clearInterval(session.songSyncIntervals[sessionId]);
+      delete session.songSyncIntervals[sessionId];
+    }
+
     if (isHost) {
       delete sessions[sessionId];
       if (session.guest) {
@@ -251,6 +276,12 @@ io.on('connection', (socket) => {
           const isHost = session.host === socket.id;
           const otherSocketId = isHost ? session.guest : session.host;
 
+          // NEW: Clear sync interval on disconnect
+          if (session.songSyncIntervals[sessionId]) {
+            clearInterval(session.songSyncIntervals[sessionId]);
+            delete session.songSyncIntervals[sessionId];
+          }
+
           if (isHost) {
             delete sessions[sessionId];
           } else if (otherSocketId) {
@@ -266,6 +297,49 @@ io.on('connection', (socket) => {
     }, 5000);
   });
 });
+
+// NEW: Song sync interval function
+function _startSongSyncInterval(sessionId, io) {
+  const session = sessions[sessionId];
+  if (!session) return;
+
+  // Clear any existing interval
+  if (session.songSyncIntervals[sessionId]) {
+    clearInterval(session.songSyncIntervals[sessionId]);
+  }
+
+  // Start 3-second check interval
+  session.songSyncIntervals[sessionId] = setInterval(() => {
+    const hostSong = session.currentSongs.host;
+    const guestSong = session.currentSongs.guest;
+
+    // Only sync if both players have song data
+    if (!hostSong || !guestSong) return;
+
+    const hostVideoId = hostSong.song?.videoId;
+    const guestVideoId = guestSong.song?.videoId;
+
+    // If different songs, sync host's song to guest
+    if (hostVideoId && guestVideoId && hostVideoId !== guestVideoId) {
+      console.log(`[${sessionId}] Song mismatch detected. Host: ${hostVideoId}, Guest: ${guestVideoId}`);
+      console.log(`[${sessionId}] Syncing host song to guest...`);
+
+      // Send sync command to guest with host's song
+      io.to(session.guest).emit('force_song_sync', {
+        song: hostSong.song,
+        durationMs: hostSong.durationMs,
+        positionMs: 0  // Start from beginning
+      });
+
+      // Update tracked songs to avoid repeated syncs
+      session.currentSongs.guest = {
+        song: hostSong.song,
+        durationMs: hostSong.durationMs,
+        updatedAt: Date.now()
+      };
+    }
+  }, 3000);  // Check every 3 seconds
+}
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
