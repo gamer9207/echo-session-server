@@ -8,17 +8,13 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: { origin: "*" },
-  transports: ["websocket", "polling"],
+  transports: ["polling", "websocket"],
   allowEIO3: true,
   pingInterval: 25000,
-  pingTimeout: 60000,
-  reconnection: true,
-  reconnectionDelay: 1000,
-  reconnectionDelayMax: 5000,
-  reconnectionAttempts: Infinity
+  pingTimeout: 60000
 });
 
-const sessions = {};
+const sessions = {}; 
 
 app.get('/', (req, res) => {
   res.send('Echo Session Server is running!');
@@ -27,24 +23,29 @@ app.get('/', (req, res) => {
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
 
+  // CREATE SESSION
   socket.on('create_session', () => {
     const sessionId = nanoid(10);
+
     sessions[sessionId] = {
-      host: socket,
+      host: socket.id,
       guest: null,
       ready: { host: false, guest: false },
       pendingSong: null,
       queue: [],
       profiles: { host: null, guest: null },
-      lastPlaybackEvent: null // FIX: Track last event
+      playbackState: { playing: false, positionMs: 0 }
     };
+
     socket.join(sessionId);
     socket.emit('session_created', { sessionId });
-    console.log(`Session created: ${sessionId} by ${socket.id}`);
+    console.log(`[${sessionId}] Session created by ${socket.id}`);
   });
 
+  // JOIN SESSION
   socket.on('join_session', ({ sessionId }) => {
     const session = sessions[sessionId];
+
     if (!session) {
       socket.emit('invalid_session', { message: 'Invalid session code.' });
       return;
@@ -54,10 +55,10 @@ io.on('connection', (socket) => {
       return;
     }
 
-    session.guest = socket;
+    session.guest = socket.id;
     socket.join(sessionId);
 
-    session.host.emit('guest_joined');
+    io.to(sessionId).emit('guest_joined');
     socket.emit('session_joined', { sessionId });
     socket.emit('queue_updated', { queue: session.queue });
 
@@ -65,47 +66,45 @@ io.on('connection', (socket) => {
       io.to(sessionId).emit('profiles_updated', session.profiles);
     }
 
-    // FIX: Sync last playback state to newly joined guest
-    if (session.lastPlaybackEvent) {
-      socket.emit('playback_event', session.lastPlaybackEvent);
-    }
-
-    console.log(`Socket ${socket.id} joined session ${sessionId}`);
+    console.log(`[${sessionId}] Socket ${socket.id} joined as guest`);
   });
 
+  // PROFILE SYNC
   socket.on('send_profile', ({ username, profileImagePath }) => {
     for (const sessionId in sessions) {
       const session = sessions[sessionId];
-      if (session.host === socket) {
+
+      if (session.host === socket.id) {
         session.profiles.host = { username, profileImagePath };
         io.to(sessionId).emit('profiles_updated', session.profiles);
-      } else if (session.guest === socket) {
+      } else if (session.guest === socket.id) {
         session.profiles.guest = { username, profileImagePath };
         io.to(sessionId).emit('profiles_updated', session.profiles);
       }
     }
   });
 
-  // FIX: Store and broadcast playback events
+  // PLAYBACK EVENTS - BROADCAST TO BOTH PEERS
   socket.on('playback_event', ({ sessionId, event, data, position }) => {
     const session = sessions[sessionId];
-    if (!session) return;
+    if (!session) {
+      console.log(`[${sessionId}] Session not found for playback event`);
+      return;
+    }
 
-    const payload = { event, position, data };
-    
-    // Store last event for newly joining guests
-    session.lastPlaybackEvent = payload;
-    
+    // Update server state
+    session.playbackState.playing = (event === 'play');
+    session.playbackState.positionMs = position || 0;
+
+    const payload = { event, position: position || 0, data };
+
     console.log(`[${sessionId}] Playback event: ${event} at ${position}ms`);
 
-    // Broadcast to peer
-    if (session.host === socket && session.guest) {
-      session.guest.emit('playback_event', payload);
-    } else if (session.guest === socket && session.host) {
-      session.host.emit('playback_event', payload);
-    }
+    // CRITICAL: Broadcast to BOTH peers (including originator for sync)
+    io.to(sessionId).emit('playback_event', payload);
   });
 
+  // SONG CHANGE SYNC
   socket.on('change_song', ({ sessionId, data }) => {
     const session = sessions[sessionId];
     if (!session) return;
@@ -113,44 +112,60 @@ io.on('connection', (socket) => {
     session.pendingSong = data;
     session.ready.host = false;
     session.ready.guest = false;
+    session.playbackState.positionMs = 0;
 
-    if (session.host) session.host.emit('prepare_song', { data });
-    if (session.guest) session.guest.emit('prepare_song', { data });
-    
     console.log(`[${sessionId}] Song change requested`);
+
+    // Send to both - let them prepare
+    io.to(sessionId).emit('prepare_song', { data });
   });
 
+  // READY FOR PLAY
   socket.on('ready_for_play', ({ sessionId }) => {
     const session = sessions[sessionId];
-    if (!session || !session.pendingSong) return;
+    if (!session || !session.pendingSong) {
+      console.log(`[${sessionId}] Ready received but no pending song`);
+      return;
+    }
 
-    if (session.host === socket) session.ready.host = true;
-    else if (session.guest === socket) session.ready.guest = true;
+    // Mark who is ready
+    if (session.host === socket.id) {
+      session.ready.host = true;
+    } else if (session.guest === socket.id) {
+      session.ready.guest = true;
+    }
 
     console.log(`[${sessionId}] Ready state: host=${session.ready.host}, guest=${session.ready.guest}`);
 
+    // When BOTH are ready, sync play
     if (session.ready.host && session.ready.guest) {
-      const syncPayload = { data: session.pendingSong };
-      session.host?.emit('sync_play', syncPayload);
-      session.guest?.emit('sync_play', syncPayload);
+      console.log(`[${sessionId}] Both ready - syncing play`);
+      
+      const startAt = Date.now() + 500; // 500ms delay for both to start
+      const payload = {
+        data: session.pendingSong,
+        startAt: startAt
+      };
 
+      // Send sync play to both peers
+      io.to(sessionId).emit('sync_play', payload);
+
+      session.playbackState.playing = true;
       session.pendingSong = null;
       session.ready.host = false;
       session.ready.guest = false;
-      
-      console.log(`[${sessionId}] Sync play initiated`);
     }
   });
 
+  // POSITION SYNC (guest -> host for keepalive)
   socket.on('playback_position', ({ sessionId, position }) => {
     const session = sessions[sessionId];
     if (!session) return;
 
-    if (session.host === socket && session.guest) {
-      session.guest.emit('playback_position', { position });
-    }
+    session.playbackState.positionMs = position;
   });
 
+  // QUEUE OPERATIONS
   socket.on('add_to_queue', ({ sessionId, song }) => {
     const session = sessions[sessionId];
     if (!session) return;
@@ -160,7 +175,7 @@ io.on('connection', (socket) => {
     }
 
     io.to(sessionId).emit('queue_updated', { queue: session.queue });
-    console.log(`[${sessionId}] Added to queue: ${song.title}`);
+    console.log(`[${sessionId}] Added to queue: ${song.title || song.videoId}`);
   });
 
   socket.on('remove_from_queue', ({ sessionId, videoId }) => {
@@ -181,7 +196,6 @@ io.on('connection', (socket) => {
     const [song] = q.splice(oldIndex, 1);
     q.splice(newIndex, 0, song);
 
-    session.queue = q;
     io.to(sessionId).emit('queue_updated', { queue: q });
   });
 
@@ -201,27 +215,31 @@ io.on('connection', (socket) => {
     io.to(sessionId).emit('queue_updated', { queue: [] });
   });
 
+  // LEAVE SESSION
   socket.on('leave_session', ({ sessionId }) => {
     const session = sessions[sessionId];
     if (!session) return;
 
-    const isHost = session.host === socket;
-    const other = isHost ? session.guest : session.host;
+    const isHost = session.host === socket.id;
+    const otherSocketId = isHost ? session.guest : session.host;
 
-    if (other) {
-      other.emit('partner_left', { by: isHost ? 'host' : 'guest' });
-    }
-
-    if (isHost) delete sessions[sessionId];
-    else {
+    if (isHost) {
+      delete sessions[sessionId];
+      if (session.guest) {
+        io.to(sessionId).emit('partner_left', { by: 'host' });
+      }
+    } else {
       session.guest = null;
       session.profiles.guest = null;
       io.to(sessionId).emit('profiles_updated', session.profiles);
+      io.to(sessionId).emit('partner_left', { by: 'guest' });
     }
 
     socket.leave(sessionId);
+    console.log(`[${sessionId}] ${socket.id} left session`);
   });
 
+  // DISCONNECT
   socket.on('disconnect', () => {
     console.log("Socket disconnected:", socket.id);
 
@@ -229,21 +247,23 @@ io.on('connection', (socket) => {
       for (const sessionId in sessions) {
         const session = sessions[sessionId];
 
-        if (session.host === socket || session.guest === socket) {
-          const isHost = session.host === socket;
-          const other = isHost ? session.guest : session.host;
+        if (session.host === socket.id || session.guest === socket.id) {
+          const isHost = session.host === socket.id;
+          const otherSocketId = isHost ? session.guest : session.host;
 
-          if (other && other.connected) {
-            other.emit('partner_left', { by: isHost ? 'host' : 'guest' });
-            session.guest = null;
-            session.profiles.guest = null;
-            io.to(sessionId).emit('profiles_updated', session.profiles);
-          } else {
+          if (isHost) {
+            delete sessions[sessionId];
+          } else if (otherSocketId) {
+            const otherSocket = io.sockets.sockets.get(otherSocketId);
+            if (otherSocket) {
+              otherSocket.emit('partner_left', { by: 'guest' });
+              otherSocket.leave(sessionId);
+            }
             delete sessions[sessionId];
           }
         }
       }
-    }, 10000);
+    }, 5000);
   });
 });
 
