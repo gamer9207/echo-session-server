@@ -15,7 +15,6 @@ const io = new Server(server, {
 });
 
 const sessions = {}; 
-const hostSyncIntervals = {}; // Track sync intervals per session
 
 app.get('/', (req, res) => {
   res.send('Echo Session Server is running!');
@@ -35,9 +34,7 @@ io.on('connection', (socket) => {
       pendingSong: null,
       queue: [],
       profiles: { host: null, guest: null },
-      playbackState: { playing: false, positionMs: 0 },
-      hostCurrentSong: null, // Track what host is currently playing
-      guestCurrentSong: null // Track what guest is currently playing
+      playbackState: { playing: false, positionMs: 0 }
     };
 
     socket.join(sessionId);
@@ -69,9 +66,6 @@ io.on('connection', (socket) => {
       io.to(sessionId).emit('profiles_updated', session.profiles);
     }
 
-    // Start 3-second sync interval when guest joins
-    _startHostSyncInterval(sessionId);
-
     console.log(`[${sessionId}] Socket ${socket.id} joined as guest`);
   });
 
@@ -88,38 +82,6 @@ io.on('connection', (socket) => {
         io.to(sessionId).emit('profiles_updated', session.profiles);
       }
     }
-  });
-
-  // TRACK HOST'S CURRENT SONG
-  socket.on('host_current_song', ({ sessionId, videoId, title, position, duration }) => {
-    const session = sessions[sessionId];
-    if (!session || session.host !== socket.id) return;
-
-    session.hostCurrentSong = {
-      videoId,
-      title,
-      position,
-      duration,
-      timestamp: Date.now()
-    };
-
-    console.log(`[${sessionId}] Host now playing: ${videoId} (${title})`);
-  });
-
-  // TRACK GUEST'S CURRENT SONG
-  socket.on('guest_current_song', ({ sessionId, videoId, title, position, duration }) => {
-    const session = sessions[sessionId];
-    if (!session || session.guest !== socket.id) return;
-
-    session.guestCurrentSong = {
-      videoId,
-      title,
-      position,
-      duration,
-      timestamp: Date.now()
-    };
-
-    console.log(`[${sessionId}] Guest now playing: ${videoId} (${title})`);
   });
 
   // PLAYBACK EVENTS - BROADCAST TO BOTH PEERS
@@ -262,11 +224,6 @@ io.on('connection', (socket) => {
     const otherSocketId = isHost ? session.guest : session.host;
 
     if (isHost) {
-      // Clear sync interval when host leaves
-      if (hostSyncIntervals[sessionId]) {
-        clearInterval(hostSyncIntervals[sessionId]);
-        delete hostSyncIntervals[sessionId];
-      }
       delete sessions[sessionId];
       if (session.guest) {
         io.to(sessionId).emit('partner_left', { by: 'host' });
@@ -295,11 +252,6 @@ io.on('connection', (socket) => {
           const otherSocketId = isHost ? session.guest : session.host;
 
           if (isHost) {
-            // Clear sync interval when host disconnects
-            if (hostSyncIntervals[sessionId]) {
-              clearInterval(hostSyncIntervals[sessionId]);
-              delete hostSyncIntervals[sessionId];
-            }
             delete sessions[sessionId];
           } else if (otherSocketId) {
             const otherSocket = io.sockets.sockets.get(otherSocketId);
@@ -314,55 +266,6 @@ io.on('connection', (socket) => {
     }, 5000);
   });
 });
-
-// Function to start 3-second sync interval for host
-function _startHostSyncInterval(sessionId) {
-  // Clear any existing interval
-  if (hostSyncIntervals[sessionId]) {
-    clearInterval(hostSyncIntervals[sessionId]);
-  }
-
-  hostSyncIntervals[sessionId] = setInterval(() => {
-    const session = sessions[sessionId];
-    
-    // Clear interval if session no longer exists
-    if (!session) {
-      if (hostSyncIntervals[sessionId]) {
-        clearInterval(hostSyncIntervals[sessionId]);
-        delete hostSyncIntervals[sessionId];
-      }
-      return;
-    }
-
-    // Only proceed if both host and guest are connected
-    if (!session.host || !session.guest || !session.hostCurrentSong) {
-      return;
-    }
-
-    const hostSong = session.hostCurrentSong;
-    const guestSong = session.guestCurrentSong;
-
-    // Compare videoIds to detect song mismatch
-    const hostVideoId = hostSong.videoId?.toString();
-    const guestVideoId = guestSong?.videoId?.toString();
-
-    if (!hostVideoId) return;
-
-    // If different songs or guest has no song, force sync
-    if (hostVideoId !== guestVideoId) {
-      console.log(`[${sessionId}] SYNC DETECTED: Host playing ${hostVideoId}, Guest playing ${guestVideoId} - forcing guest to sync`);
-
-      // Send force_sync event to guest with host's current song
-      io.to(sessionId).emit('force_sync_song', {
-        videoId: hostSong.videoId,
-        title: hostSong.title,
-        position: hostSong.position,
-        duration: hostSong.duration,
-        timestamp: Date.now()
-      });
-    }
-  }, 3000); // Check every 3 seconds
-}
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
