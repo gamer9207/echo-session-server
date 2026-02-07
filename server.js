@@ -8,16 +8,13 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: { origin: "*" },
-
-  // ---- CRITICAL FIXES ----
-  transports: ["polling", "websocket"],  // Fix for Nothing Phone 3 Pro
-  allowEIO3: true,                       // Better backward compatibility
-  pingInterval: 25000,                   // Prevents random disconnects
-  pingTimeout: 60000                     // Render free plan slow wakeups
+  transports: ["polling", "websocket"],
+  allowEIO3: true,
+  pingInterval: 25000,
+  pingTimeout: 60000
 });
 
-const sessions = {}; 
-// Format: { host, guest, ready, pendingSong, queue, profiles }
+const sessions = {};
 
 app.get('/', (req, res) => {
   res.send('Echo Session Server is running!');
@@ -26,7 +23,6 @@ app.get('/', (req, res) => {
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
 
-  // ---------------- CREATE SESSION ----------------
   socket.on('create_session', () => {
     const sessionId = nanoid(10);
 
@@ -45,7 +41,6 @@ io.on('connection', (socket) => {
     console.log(`Session created: ${sessionId} by ${socket.id}`);
   });
 
-  // ---------------- JOIN SESSION ----------------
   socket.on('join_session', ({ sessionId }) => {
     const session = sessions[sessionId];
 
@@ -73,7 +68,6 @@ io.on('connection', (socket) => {
     console.log(`Socket ${socket.id} joined session ${sessionId}`);
   });
 
-  // ---------------- PROFILE SYNC ----------------
   socket.on('send_profile', ({ username, profileImagePath }) => {
     for (const sessionId in sessions) {
       const session = sessions[sessionId];
@@ -89,20 +83,28 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ---------------- PLAYBACK EVENTS ----------------
+  // FIX: CRITICAL - Echo playback events to BOTH peers
   socket.on('playback_event', ({ sessionId, event, data, position }) => {
     const session = sessions[sessionId];
     if (!session) return;
 
     const payload = { event, position, data };
 
-    if (session.host === socket && session.guest)
+    console.log(`[PLAYBACK] Session ${sessionId}: ${event} at ${position}ms`);
+
+    // Echo back to ORIGINATOR (so they know it was received)
+    socket.emit('playback_event', payload);
+
+    // Send to OTHER peer
+    if (session.host === socket && session.guest) {
       session.guest.emit('playback_event', payload);
-    else if (session.guest === socket && session.host)
+      console.log(`  -> Sent to guest: ${session.guest.id}`);
+    } else if (session.guest === socket && session.host) {
       session.host.emit('playback_event', payload);
+      console.log(`  -> Sent to host: ${session.host.id}`);
+    }
   });
 
-  // ---------------- SONG CHANGE SYNC ----------------
   socket.on('change_song', ({ sessionId, data }) => {
     const session = sessions[sessionId];
     if (!session) return;
@@ -123,8 +125,9 @@ io.on('connection', (socket) => {
     else if (session.guest === socket) session.ready.guest = true;
 
     if (session.ready.host && session.ready.guest) {
-      session.host?.emit('sync_play', { data: session.pendingSong });
-      session.guest?.emit('sync_play', { data: session.pendingSong });
+      const syncData = { data: session.pendingSong };
+      session.host?.emit('sync_play', syncData);
+      session.guest?.emit('sync_play', syncData);
 
       session.pendingSong = null;
       session.ready.host = false;
@@ -132,7 +135,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ---------------- POSITION SYNC ----------------
   socket.on('playback_position', ({ sessionId, position }) => {
     const session = sessions[sessionId];
     if (!session) return;
@@ -141,7 +143,6 @@ io.on('connection', (socket) => {
       session.guest.emit('playback_position', { position });
   });
 
-  // ---------------- QUEUE OPS ----------------
   socket.on('add_to_queue', ({ sessionId, song }) => {
     const session = sessions[sessionId];
     if (!session) return;
@@ -191,7 +192,6 @@ io.on('connection', (socket) => {
     io.to(sessionId).emit('queue_updated', { queue: [] });
   });
 
-  // ---------------- LEAVE SESSION ----------------
   socket.on('leave_session', ({ sessionId }) => {
     const session = sessions[sessionId];
     if (!session) return;
@@ -213,11 +213,9 @@ io.on('connection', (socket) => {
     socket.leave(sessionId);
   });
 
-  // ---------------- DISCONNECT (SAFE VERSION) ----------------
   socket.on('disconnect', () => {
     console.log("Socket disconnected:", socket.id);
 
-    // Wait 10 seconds before destroying session
     setTimeout(() => {
       for (const sessionId in sessions) {
         const session = sessions[sessionId];
@@ -236,7 +234,7 @@ io.on('connection', (socket) => {
           }
         }
       }
-    }, 10000); // <--- prevents instant session-ending on Nothing OS
+    }, 10000);
   });
 });
 
