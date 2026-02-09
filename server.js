@@ -34,7 +34,7 @@ io.on('connection', (socket) => {
       pendingSong: null,
       queue: [],
       profiles: { host: null, guest: null },
-      playbackState: { playing: false, positionMs: 0 }
+      playbackState: { playing: false, positionMs: 0, currentSongId: null }
     };
 
     socket.join(sessionId);
@@ -113,6 +113,7 @@ io.on('connection', (socket) => {
     session.ready.host = false;
     session.ready.guest = false;
     session.playbackState.positionMs = 0;
+    session.playbackState.currentSongId = data?.song?.videoId || null;
 
     console.log(`[${sessionId}] Song change requested`);
 
@@ -213,6 +214,17 @@ io.on('connection', (socket) => {
 
     session.queue = [];
     io.to(sessionId).emit('queue_updated', { queue: [] });
+  });
+
+  // NEW: Remove finished song from queue
+  socket.on('song_completed', ({ sessionId, videoId }) => {
+    const session = sessions[sessionId];
+    if (!session) return;
+
+    session.queue = session.queue.filter(s => s.videoId !== videoId);
+    session.playbackState.currentSongId = null;
+    io.to(sessionId).emit('queue_updated', { queue: session.queue });
+    console.log(`[${sessionId}] Removed completed song from queue: ${videoId}`);
   });
 
   // LEAVE SESSION
