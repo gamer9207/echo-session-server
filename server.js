@@ -33,10 +33,8 @@ io.on('connection', (socket) => {
       ready: { host: false, guest: false },
       pendingSong: null,
       queue: [],
-      currentPlaylistId: null, // Track current playlist context
-      playlistSongIds: [], // Track which songs came from current playlist
       profiles: { host: null, guest: null },
-      playbackState: { playing: false, positionMs: 0, currentSongId: null }
+      playbackState: { playing: false, positionMs: 0 }
     };
 
     socket.join(sessionId);
@@ -107,7 +105,7 @@ io.on('connection', (socket) => {
   });
 
   // SONG CHANGE SYNC
-  socket.on('change_song', ({ sessionId, data, playlistId }) => {
+  socket.on('change_song', ({ sessionId, data }) => {
     const session = sessions[sessionId];
     if (!session) return;
 
@@ -115,22 +113,8 @@ io.on('connection', (socket) => {
     session.ready.host = false;
     session.ready.guest = false;
     session.playbackState.positionMs = 0;
-    session.playbackState.currentSongId = data?.song?.videoId || null;
 
-    // If playing from a playlist, update playlist context
-    if (playlistId) {
-      session.currentPlaylistId = playlistId;
-    } else {
-      // If playing a single song (not from playlist), clear playlist context and remove playlist songs
-      if (session.currentPlaylistId !== null) {
-        console.log(`[${sessionId}] Cleared playlist context, removing ${session.playlistSongIds.length} playlist songs`);
-        session.queue = session.queue.filter(s => !session.playlistSongIds.includes(s.videoId));
-        session.currentPlaylistId = null;
-        session.playlistSongIds = [];
-      }
-    }
-
-    console.log(`[${sessionId}] Song change requested from playlist: ${playlistId || 'NONE'}`);
+    console.log(`[${sessionId}] Song change requested`);
 
     // Send to both - let them prepare
     io.to(sessionId).emit('prepare_song', { data });
@@ -181,33 +165,11 @@ io.on('connection', (socket) => {
     session.playbackState.positionMs = position;
   });
 
-  // UPDATE PLAYLIST CONTEXT - when songs from playlist are added
-  socket.on('update_playlist_context', ({ sessionId, playlistId, playlistSongs }) => {
-    const session = sessions[sessionId];
-    if (!session) return;
-
-    session.currentPlaylistId = playlistId;
-    const newPlaylistSongIds = playlistSongs.map(s => s.videoId);
-    
-    // Add playlist songs to queue
-    for (const song of playlistSongs) {
-      if (!session.queue.some(s => s.videoId === song.videoId)) {
-        session.queue.push(song);
-      }
-    }
-    
-    session.playlistSongIds = newPlaylistSongIds;
-    console.log(`[${sessionId}] Updated playlist context: ${playlistId}, added ${newPlaylistSongIds.length} songs`);
-    
-    io.to(sessionId).emit('queue_updated', { queue: session.queue });
-  });
-
   // QUEUE OPERATIONS
   socket.on('add_to_queue', ({ sessionId, song }) => {
     const session = sessions[sessionId];
     if (!session) return;
 
-    // Don't add if already in queue
     if (!session.queue.some(s => s.videoId === song.videoId)) {
       session.queue.push(song);
     }
@@ -221,8 +183,6 @@ io.on('connection', (socket) => {
     if (!session) return;
 
     session.queue = session.queue.filter(s => s.videoId !== videoId);
-    session.playlistSongIds = session.playlistSongIds.filter(id => id !== videoId);
-    
     io.to(sessionId).emit('queue_updated', { queue: session.queue });
   });
 
@@ -252,22 +212,7 @@ io.on('connection', (socket) => {
     if (!session) return;
 
     session.queue = [];
-    session.playlistSongIds = [];
-    session.currentPlaylistId = null;
     io.to(sessionId).emit('queue_updated', { queue: [] });
-  });
-
-  // SONG COMPLETED - remove from queue
-  socket.on('song_completed', ({ sessionId, videoId }) => {
-    const session = sessions[sessionId];
-    if (!session) return;
-
-    session.queue = session.queue.filter(s => s.videoId !== videoId);
-    session.playlistSongIds = session.playlistSongIds.filter(id => id !== videoId);
-    session.playbackState.currentSongId = null;
-    
-    io.to(sessionId).emit('queue_updated', { queue: session.queue });
-    console.log(`[${sessionId}] Removed completed song from queue: ${videoId}`);
   });
 
   // LEAVE SESSION
